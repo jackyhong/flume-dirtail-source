@@ -18,3 +18,4 @@
     agent.sources.originallog.charset = UTF-8                                （default）
     agent.sources.originallog.batchTimeout = 3000                            （default）
     agent.sources.originallog.bufferCount = 20                               （default）
+    agent.sources.originallog.topicByFileName = false                        （default）
