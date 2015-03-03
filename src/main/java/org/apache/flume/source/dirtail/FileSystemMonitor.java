@@ -74,7 +74,7 @@ public class FileSystemMonitor {
         String p = event.getFile().getName().getPath();
         if (!filesSet.contains(p) && dirPattern.isMatchFile(event)) {
             filesSet.add(p);
-            source.commitTask(p, isNew);
+            source.commitTask(p, event.getFile().getName().getBaseName(), isNew);
         }
     }
 
