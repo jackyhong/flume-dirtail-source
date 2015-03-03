@@ -48,18 +48,19 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 public class DirTailSource extends AbstractSource implements EventDrivenSource, Configurable {
 
-    private static final Logger                        logger          = LoggerFactory.getLogger(DirTailSource.class);
+    private static final Logger                        logger               = LoggerFactory.getLogger(DirTailSource.class);
 
-    private String                                     command         = "tail -F -n ";
-    private DirPattern                                 dirPattern      = new DirPattern();
+    private String                                     command              = "tail -F -n ";
+    private DirPattern                                 dirPattern           = new DirPattern();
     private SourceCounter                              sourceCounter;
     private ExecutorService                            executor;
     private Integer                                    bufferCount;
     private long                                       batchTimeout;
     private Charset                                    charset;
-    private Map<String, Pair<ExecRunnable, Future<?>>> runningMap      = new HashMap<String, Pair<ExecRunnable, Future<?>>>();
+    private Map<String, Pair<ExecRunnable, Future<?>>> runningMap           = new HashMap<String, Pair<ExecRunnable, Future<?>>>();
     private FileSystemMonitor                          fsm;
-    private boolean                                    topicByFileName = false;
+    private boolean                                    topicByFileName      = false;
+    private boolean                                    splitFileName2Header = false;
 
     @Override
     public void start() {
@@ -108,6 +109,7 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
         dirPattern.setPath(context.getString("dirPath"));
         dirPattern.setFilePattern(context.getString("file-pattern", "^(.*)$"));
         topicByFileName = context.getBoolean("topicByFileName", false);
+        splitFileName2Header = context.getBoolean("splitFileName2Header", false);
     }
 
     public void commitTask(String path, String fileName, boolean isNewFile) {
@@ -116,7 +118,7 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
         logger.info("add task " + path);
         ExecRunnable runner =
                 new ExecRunnable(command + (isNewFile ? "100000000" : "0") + " " + path, getChannelProcessor(), sourceCounter, bufferCount, batchTimeout, charset, fileName,
-                        topicByFileName);
+                        topicByFileName, splitFileName2Header);
         runningMap.put(path, new Pair<DirTailSource.ExecRunnable, Future<?>>(runner, executor.submit(runner)));
     }
 
@@ -132,7 +134,7 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
     private static class ExecRunnable implements Runnable {
 
         public ExecRunnable(String command, ChannelProcessor channelProcessor, SourceCounter sourceCounter, int bufferCount, long batchTimeout, Charset charset, String fileName,
-                boolean topicByFileName) {
+                boolean topicByFileName, boolean splitFileName2Header) {
             this.command = command;
             this.channelProcessor = channelProcessor;
             this.sourceCounter = sourceCounter;
@@ -141,6 +143,7 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
             this.charset = charset;
             this.fileName = fileName;
             this.topicByFileName = topicByFileName;
+            this.splitFileName2Header = splitFileName2Header;
         }
 
         private final String           command;
@@ -156,9 +159,19 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
         ScheduledFuture<?>             future;
         private String                 fileName;
         private boolean                topicByFileName;
+        private boolean                splitFileName2Header;
 
         @Override
         public void run() {
+            String topic = null, type = null;
+            if (splitFileName2Header) {
+                if (fileName.contains(".") && fileName.contains("_") && fileName.indexOf(".") > fileName.indexOf("_")) {
+                    topic = fileName.substring(0, fileName.indexOf("_"));
+                    type = fileName.substring(fileName.indexOf("_") + 1, fileName.indexOf("."));
+                } else {
+                    logger.warn("splitFileName2Header Failed : " + fileName);
+                }
+            }
 
             BufferedReader reader = null;
             String line = null;
@@ -192,6 +205,10 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
                         Event et = EventBuilder.withBody(line.getBytes(charset));
                         if (topicByFileName) {
                             et.getHeaders().put("topic", fileName);
+                        }
+                        if (splitFileName2Header && topic != null && type != null) {
+                            et.getHeaders().put("topic", topic);
+                            et.getHeaders().put("type", type);
                         }
                         eventList.add(et);
                         if (eventList.size() >= bufferCount || timeout()) {
