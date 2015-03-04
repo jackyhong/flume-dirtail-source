@@ -194,7 +194,7 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
                     Executors.newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setNameFormat("timedFlushExecService" + Thread.currentThread().getId() + "-%d").build());
             do {
                 try {
-                    command = commandbasic + (fromHead ? " 100000000" : "0") + " " + path;
+                    command = commandbasic + (fromHead ? "+0 " : "0 ") + path;
                     fromHead = false;
                     String[] commandArgs = command.split("\\s+");
                     process = new ProcessBuilder(commandArgs).start();
