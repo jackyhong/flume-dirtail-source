@@ -23,6 +23,8 @@
     agent.sources.originallog.batchTimeout = 3000                            （default）
     agent.sources.originallog.bufferCount = 20                               （default）
     agent.sources.originallog.topicByFileName = false                        （default）
+    agent.sources.originallog.restart = false                                （default）
+    agent.sources.originallog.restartThrottle = 10000                        （default）
 
 # TopicInterceptor
 
