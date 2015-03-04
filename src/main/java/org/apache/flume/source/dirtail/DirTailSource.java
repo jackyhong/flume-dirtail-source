@@ -50,7 +50,6 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
 
     private static final Logger                        logger               = LoggerFactory.getLogger(DirTailSource.class);
 
-    private String                                     command              = "tail -F -n ";
     private DirPattern                                 dirPattern           = new DirPattern();
     private SourceCounter                              sourceCounter;
     private ExecutorService                            executor;
@@ -61,6 +60,8 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
     private FileSystemMonitor                          fsm;
     private boolean                                    topicByFileName      = false;
     private boolean                                    splitFileName2Header = false;
+    private boolean                                    restart;
+    private long                                       restartThrottle;
 
     @Override
     public void start() {
@@ -75,9 +76,10 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
 
     @Override
     public void stop() {
-        logger.info("Stopping dir tail  source with command:{}", command);
+        logger.info("Stopping dir tail  source" + dirPattern.getPath());
         fsm.stop();
         for (Map.Entry<String, Pair<ExecRunnable, Future<?>>> e : runningMap.entrySet()) {
+            e.getValue().getLeft().setRestart(false);
             e.getValue().getLeft().kill();
             e.getValue().getRight().cancel(true);
         }
@@ -94,7 +96,7 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
         }
         sourceCounter.stop();
         super.stop();
-        logger.debug("DirTair source with command:{} stopped. Metrics:{}", command, sourceCounter);
+        logger.debug("DirTair source with path:{} stopped. Metrics:{}", dirPattern.getPath(), sourceCounter);
     }
 
     @Override
@@ -110,21 +112,24 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
         dirPattern.setFilePattern(context.getString("file-pattern", "^(.*)$"));
         topicByFileName = context.getBoolean("topicByFileName", false);
         splitFileName2Header = context.getBoolean("splitFileName2Header", false);
+        restart = context.getBoolean(ExecSourceConfigurationConstants.CONFIG_RESTART, ExecSourceConfigurationConstants.DEFAULT_RESTART);
+        restartThrottle = context.getLong(ExecSourceConfigurationConstants.CONFIG_RESTART_THROTTLE, ExecSourceConfigurationConstants.DEFAULT_RESTART_THROTTLE);
     }
 
-    public void commitTask(String path, String fileName, boolean isNewFile) {
+    public void commitTask(String path, String fileName, boolean fromHead) {
         if (runningMap.containsKey(path))
             return;
         logger.info("add task " + path);
         ExecRunnable runner =
-                new ExecRunnable(command + (isNewFile ? "100000000" : "0") + " " + path, getChannelProcessor(), sourceCounter, bufferCount, batchTimeout, charset, fileName,
-                        topicByFileName, splitFileName2Header);
+                new ExecRunnable(path, fromHead, getChannelProcessor(), sourceCounter, bufferCount, batchTimeout, charset, fileName, topicByFileName, splitFileName2Header,
+                        restart, restartThrottle);
         runningMap.put(path, new Pair<DirTailSource.ExecRunnable, Future<?>>(runner, executor.submit(runner)));
     }
 
     public void removeTask(String path) {
         if (runningMap.containsKey(path)) {
             logger.info("remove task " + path);
+            runningMap.get(path).getLeft().setRestart(false);
             runningMap.get(path).getLeft().kill();
             runningMap.get(path).getRight().cancel(true);
             runningMap.remove(path);
@@ -133,20 +138,25 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
 
     private static class ExecRunnable implements Runnable {
 
-        public ExecRunnable(String command, ChannelProcessor channelProcessor, SourceCounter sourceCounter, int bufferCount, long batchTimeout, Charset charset, String fileName,
-                boolean topicByFileName, boolean splitFileName2Header) {
-            this.command = command;
+        public ExecRunnable(String path, boolean fromHead, ChannelProcessor channelProcessor, SourceCounter sourceCounter, int bufferCount, long batchTimeout, Charset charset,
+                String fileName, boolean topicByFileName, boolean splitFileName2Header, boolean restart, long restartThrottle) {
+            this.commandbasic = "tail -F -n ";
             this.channelProcessor = channelProcessor;
             this.sourceCounter = sourceCounter;
             this.bufferCount = bufferCount;
             this.batchTimeout = batchTimeout;
             this.charset = charset;
+            this.path = path;
             this.fileName = fileName;
+            this.fromHead = fromHead;
             this.topicByFileName = topicByFileName;
             this.splitFileName2Header = splitFileName2Header;
+            this.restart = restart;
+            this.restartThrottle = restartThrottle;
         }
 
-        private final String           command;
+        private final String           commandbasic;
+        private String                 command;
         private final ChannelProcessor channelProcessor;
         private final SourceCounter    sourceCounter;
         private final int              bufferCount;
@@ -157,9 +167,13 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
         private Long                   lastPushToChannel = systemClock.currentTimeMillis();
         ScheduledExecutorService       timedFlushService;
         ScheduledFuture<?>             future;
+        private String                 path;
         private String                 fileName;
+        boolean                        fromHead;
         private boolean                topicByFileName;
         private boolean                splitFileName2Header;
+        private volatile boolean       restart;
+        private long                   restartThrottle;
 
         @Override
         public void run() {
@@ -178,64 +192,72 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
             final List<Event> eventList = new ArrayList<Event>();
             timedFlushService =
                     Executors.newSingleThreadScheduledExecutor(new ThreadFactoryBuilder().setNameFormat("timedFlushExecService" + Thread.currentThread().getId() + "-%d").build());
-            try {
-                String[] commandArgs = command.split("\\s+");
-                process = new ProcessBuilder(commandArgs).start();
-                reader = new BufferedReader(new InputStreamReader(process.getInputStream(), charset));
-                future = timedFlushService.scheduleWithFixedDelay(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            synchronized (eventList) {
-                                if (!eventList.isEmpty() && timeout()) {
-                                    flushEventBatch(eventList);
+            do {
+                try {
+                    command = commandbasic + (fromHead ? " 100000000" : "0") + " " + path;
+                    fromHead = false;
+                    String[] commandArgs = command.split("\\s+");
+                    process = new ProcessBuilder(commandArgs).start();
+                    reader = new BufferedReader(new InputStreamReader(process.getInputStream(), charset));
+                    future = timedFlushService.scheduleWithFixedDelay(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                synchronized (eventList) {
+                                    if (!eventList.isEmpty() && timeout()) {
+                                        flushEventBatch(eventList);
+                                    }
+                                }
+                            } catch (Exception e) {
+                                logger.error("Exception occured when processing event batch", e);
+                                if (e instanceof InterruptedException) {
+                                    Thread.currentThread().interrupt();
                                 }
                             }
-                        } catch (Exception e) {
-                            logger.error("Exception occured when processing event batch", e);
-                            if (e instanceof InterruptedException) {
-                                Thread.currentThread().interrupt();
+                        }
+                    }, batchTimeout, batchTimeout, TimeUnit.MILLISECONDS);
+                    while ((line = reader.readLine()) != null) {
+                        synchronized (eventList) {
+                            sourceCounter.incrementEventReceivedCount();
+                            Event et = EventBuilder.withBody(line.getBytes(charset));
+                            if (topicByFileName) {
+                                et.getHeaders().put("topic", fileName);
+                            }
+                            if (splitFileName2Header && topic != null && type != null) {
+                                et.getHeaders().put("topic", topic);
+                                et.getHeaders().put("type", type);
+                            }
+                            eventList.add(et);
+                            if (eventList.size() >= bufferCount || timeout()) {
+                                flushEventBatch(eventList);
                             }
                         }
                     }
-                }, batchTimeout, batchTimeout, TimeUnit.MILLISECONDS);
-                while ((line = reader.readLine()) != null) {
                     synchronized (eventList) {
-                        sourceCounter.incrementEventReceivedCount();
-                        Event et = EventBuilder.withBody(line.getBytes(charset));
-                        if (topicByFileName) {
-                            et.getHeaders().put("topic", fileName);
-                        }
-                        if (splitFileName2Header && topic != null && type != null) {
-                            et.getHeaders().put("topic", topic);
-                            et.getHeaders().put("type", type);
-                        }
-                        eventList.add(et);
-                        if (eventList.size() >= bufferCount || timeout()) {
+                        if (!eventList.isEmpty()) {
                             flushEventBatch(eventList);
                         }
                     }
-                }
-                synchronized (eventList) {
-                    if (!eventList.isEmpty()) {
-                        flushEventBatch(eventList);
+                } catch (Exception e) {
+                    logger.error("Failed while running command: " + command, e);
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
                     }
-                }
-            } catch (Exception e) {
-                logger.error("Failed while running command: " + command, e);
-                if (e instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                }
-            } finally {
-                if (reader != null) {
-                    try {
-                        reader.close();
-                    } catch (IOException ex) {
-                        logger.error("Failed to close reader for dir tail source", ex);
+                } finally {
+                    if (reader != null) {
+                        try {
+                            reader.close();
+                        } catch (IOException ex) {
+                            logger.error("Failed to close reader for dir tail source", ex);
+                        }
                     }
+                    kill();
                 }
-                kill();
-            }
+                try {
+                    Thread.sleep(restartThrottle);
+                } catch (InterruptedException e) {
+                }
+            } while (restart);
         }
 
         private void flushEventBatch(List<Event> eventList) {
@@ -247,6 +269,10 @@ public class DirTailSource extends AbstractSource implements EventDrivenSource, 
 
         private boolean timeout() {
             return (systemClock.currentTimeMillis() - lastPushToChannel) >= batchTimeout;
+        }
+
+        public void setRestart(boolean restart) {
+            this.restart = restart;
         }
 
         public int kill() {
